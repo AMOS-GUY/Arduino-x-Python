@@ -237,6 +237,9 @@ class WorkerTrackerApp:
 
                     if hand_results.multi_hand_landmarks:
                         hand_landmarks = hand_results.multi_hand_landmarks[0]
+                        print("✅ HAND DETECTED!")
+                        self.detector.mp_draw.draw_landmarks(processed_frame, hand_landmarks,
+                                                             self.detector.mp_hands.HAND_CONNECTIONS)
                         self.detector.mp_draw.draw_landmarks(processed_frame, hand_landmarks,
                                                              self.detector.mp_hands.HAND_CONNECTIONS)
 
