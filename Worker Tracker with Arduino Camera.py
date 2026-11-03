@@ -10,7 +10,6 @@ import threading
 import time
 from datetime import datetime
 import urllib.request
-#import numpy2 as np
 import math
 
 # ==========================================
@@ -18,7 +17,7 @@ import math
 # ==========================================
 EXCEL_FILE = "workers_track.xlsx"
 ESP32_CAMERA_URL = "http://192.168.4.1/capture"
-ESP32_BUZZ_URL = "http://192.168.4.1/buzz?ms=2000"  # 2-second alarm beep
+ESP32_PITCH_URL = "http://192.168.4.1/pitch?freq="
 
 BREAK_DURATION_SECONDS = 300
 
@@ -75,32 +74,27 @@ class Detector:
         return status, frame
 
     def is_open_hand(self, hand_landmarks):
+        # STRICT 5-FINGER CHECK: All 4 fingers + thumb must be extended
         fingers_extended = 0
-        # Check if 4 fingers are extended (Tip Y < PIP Y)
         if hand_landmarks[8].y < hand_landmarks[6].y: fingers_extended += 1  # Index
         if hand_landmarks[12].y < hand_landmarks[10].y: fingers_extended += 1  # Middle
         if hand_landmarks[16].y < hand_landmarks[14].y: fingers_extended += 1  # Ring
         if hand_landmarks[20].y < hand_landmarks[18].y: fingers_extended += 1  # Pinky
 
-        # Thumb extended if tip is further from wrist (0) than the IP joint (3)
         def dist(p1, p2):
             return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
         thumb_extended = dist(hand_landmarks[4], hand_landmarks[0]) > dist(hand_landmarks[3], hand_landmarks[0])
 
-        return (fingers_extended >= 3 and thumb_extended)
+        return (fingers_extended == 4 and thumb_extended)  # MUST be exactly 5 digits
 
     def is_thumbs_up(self, hand_landmarks):
-        # Thumb tip (4) is higher (smaller Y) than the thumb base/MCP (2)
         thumb_up = hand_landmarks[4].y < hand_landmarks[2].y
-
-        # Other fingers are curled (Tip Y > PIP Y)
         fingers_curled = 0
         if hand_landmarks[8].y > hand_landmarks[6].y: fingers_curled += 1
         if hand_landmarks[12].y > hand_landmarks[10].y: fingers_curled += 1
         if hand_landmarks[16].y > hand_landmarks[14].y: fingers_curled += 1
         if hand_landmarks[20].y > hand_landmarks[18].y: fingers_curled += 1
-
         return thumb_up and (fingers_curled >= 3)
 
 
@@ -122,6 +116,7 @@ class WorkerTrackerApp:
         self.elapsed_downtime = 0
         self.break_end_time = 0
         self.last_buzz_time = 0
+        self.frame_count = 0
 
         self.detector = Detector()
 
@@ -177,8 +172,6 @@ class WorkerTrackerApp:
         self.lbl_posture.pack(pady=10)
         self.lbl_downtime = tk.Label(info_panel, text="Total Downtime: 0s", font=label_font, bg="#34495e", fg="#e74c3c")
         self.lbl_downtime.pack(pady=10)
-
-        # New Gesture Feedback Label
         self.lbl_gesture = tk.Label(info_panel, text="Gesture: None", font=label_font, bg="#34495e", fg="#3498db")
         self.lbl_gesture.pack(pady=10)
 
@@ -206,6 +199,20 @@ class WorkerTrackerApp:
 
         threading.Thread(target=self.process_loop, daemon=True).start()
 
+    def trigger_double_buzzer(self):
+        """Sounds the buzzer twice rapidly as a penalty."""
+        try:
+            urllib.request.urlopen(ESP32_PITCH_URL + "800", timeout=1)  # Beep 1
+            time.sleep(0.15)
+            urllib.request.urlopen(ESP32_PITCH_URL + "0", timeout=1)  # Stop
+            time.sleep(0.15)
+            urllib.request.urlopen(ESP32_PITCH_URL + "800", timeout=1)  # Beep 2
+            time.sleep(0.15)
+            urllib.request.urlopen(ESP32_PITCH_URL + "0", timeout=1)  # Stop
+            print("🚨 DOUBLE BUZZER TRIGGERED (False Alarm)!")
+        except Exception as e:
+            print(f"Buzzer failed: {e}")
+
     def process_loop(self):
         last_time = time.time()
 
@@ -224,92 +231,94 @@ class WorkerTrackerApp:
                 last_time = current_time
 
                 if self.on_break:
-                    self.handle_break_logic()
-                    self.root.after(0, self.update_gui_safe, "On Break", frame, True)
+                    if time.time() >= self.break_end_time:
+                        self.on_break = False
+                        self.root.after(0, lambda: self.lbl_status.config(text="Status: Working", fg="#2ecc71"))
+                    self.root.after(0, self.update_gui_safe, "On Break", frame, True, "On Break")
                 else:
-                    # 1. Run Posture Detection
                     posture_status, processed_frame = self.detector.check_posture(frame)
-
-                    # 2. Run Gesture Detection
-                    img_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-                    hand_results = self.detector.hands.process(img_rgb)
                     gesture_status = "None"
 
-                    if hand_results.multi_hand_landmarks:
-                        hand_landmarks = hand_results.multi_hand_landmarks[0]
-                        print("✅ HAND DETECTED!")
-                        self.detector.mp_draw.draw_landmarks(processed_frame, hand_landmarks,
-                                                             self.detector.mp_hands.HAND_CONNECTIONS)
-                        self.detector.mp_draw.draw_landmarks(processed_frame, hand_landmarks,
-                                                             self.detector.mp_hands.HAND_CONNECTIONS)
+                    # Run Gesture Detection every 4th frame to save CPU
+                    self.frame_count += 1
+                    if self.frame_count % 4 == 0:
+                        img_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                        hand_results = self.detector.hands.process(img_rgb)
 
-                        open_hand = self.detector.is_open_hand(hand_landmarks)
-                        thumbs_up = self.detector.is_thumbs_up(hand_landmarks)
+                        if hand_results.multi_hand_landmarks:
+                            hand_landmarks = hand_results.multi_hand_landmarks[0]
+                            self.detector.mp_draw.draw_landmarks(processed_frame, hand_landmarks,
+                                                                 self.detector.mp_hands.HAND_CONNECTIONS)
 
-                        if thumbs_up:
-                            gesture_status = "Thumbs Up! 👍"
-                        elif open_hand:
-                            gesture_status = "Open Hand ✋"
-                        else:
-                            gesture_status = "Hand Detected"
+                            # --- ADD THIS FINGERTIP RADAR ---
+                            h, w, _ = processed_frame.shape
+                            thumb_tip = hand_landmarks[4]
+                            index_tip = hand_landmarks[8]
 
-                        # GESTURE STATE MACHINE
-                        if self.awaiting_thumbs_up:
+                            # Draw big red dots on the exact fingertips
+                            cv2.circle(processed_frame, (int(thumb_tip.x * w), int(thumb_tip.y * h)), 12, (0, 0, 255),
+                                       -1)
+                            cv2.circle(processed_frame, (int(index_tip.x * w), int(index_tip.y * h)), 12, (0, 0, 255),
+                                       -1)
+
+                            open_hand = self.detector.is_open_hand(hand_landmarks)
+                            thumbs_up = self.detector.is_thumbs_up(hand_landmarks)
+
                             if thumbs_up:
-                                # CONFIRMED: Grant break
-                                self.root.after(0, self.confirm_break)
-                                self.awaiting_thumbs_up = False
-                                self.hand_raise_start = 0
-                            elif not open_hand:
-                                # FALSE ALARM: Hand lowered without thumbs up
-                                self.trigger_rapid_buzzer()
-                                self.root.after(0, lambda: self.lbl_status.config(
-                                    text="Status: False Alarm! Keep working.", fg="#e74c3c"))
-                                self.awaiting_thumbs_up = False
-                                self.hand_raise_start = 0
-                        else:
-                            if open_hand:
-                                if self.hand_raise_start == 0:
-                                    self.hand_raise_start = current_time
-                                elif current_time - self.hand_raise_start >= 5.0:
-                                    # 5 seconds reached!
-                                    self.awaiting_thumbs_up = True
-                                    self.root.after(0, lambda: self.lbl_status.config(
-                                        text="Status: Show THUMBS UP to confirm break!", fg="#f1c40f"))
+                                gesture_status = "Thumbs Up! 👍"
+                            elif open_hand:
+                                gesture_status = "Open Hand (5 Fingers) ✋"
                             else:
-                                self.hand_raise_start = 0
+                                gesture_status = "Hand Detected"
 
-                    # Update Time Logic based on posture
+                            # GESTURE STATE MACHINE
+                            if self.awaiting_thumbs_up:
+                                if thumbs_up:
+                                    # CONFIRMED: Grant break
+                                    self.on_break = True
+                                    self.break_end_time = time.time() + BREAK_DURATION_SECONDS
+                                    self.root.after(0, lambda: self.lbl_status.config(
+                                        text=f"Status: ON BREAK ({BREAK_DURATION_SECONDS}s)", fg="#f1c40f"))
+                                    self.root.after(0, lambda: self.lbl_timer.config(foreground="#f1c40f"))
+                                    self.awaiting_thumbs_up = False
+                                    self.hand_raise_start = 0
+                                elif not open_hand and not thumbs_up:
+                                    # FALSE ALARM: Hand lowered/closed without thumbs up
+                                    self.trigger_double_buzzer()
+                                    self.root.after(0, lambda: self.lbl_status.config(
+                                        text="Status: False Alarm! Keep working.", fg="#e74c3c"))
+                                    self.awaiting_thumbs_up = False
+                                    self.hand_raise_start = 0
+                            else:
+                                if open_hand:
+                                    if self.hand_raise_start == 0:
+                                        self.hand_raise_start = current_time
+                                    elif current_time - self.hand_raise_start >= 5.0:
+                                        # 5 seconds reached!
+                                        self.awaiting_thumbs_up = True
+                                        self.root.after(0, lambda: self.lbl_status.config(
+                                            text="Show THUMBS UP to confirm break!", fg="#f1c40f"))
+                                else:
+                                    self.hand_raise_start = 0
+
+                    # Posture Time Logic
                     if posture_status == "Working":
                         self.elapsed_work_time += delta_time
                     elif posture_status in ["Not Working", "Sleeping"]:
                         self.elapsed_downtime += delta_time
                         if current_time - self.last_buzz_time > 3.0:
                             try:
-                                urllib.request.urlopen(ESP32_BUZZ_URL, timeout=1)
+                                urllib.request.urlopen(ESP32_PITCH_URL + "800", timeout=1)  # Posture alarm
                                 self.last_buzz_time = current_time
                             except Exception as e:
                                 print(f"Buzzer failed: {e}")
 
                     self.root.after(0, self.update_gui_safe, posture_status, processed_frame, False, gesture_status)
-                time.sleep(0.1)
+
+                time.sleep(0.15)
             except Exception as e:
                 print(f"Stream error: {e}")
                 time.sleep(1)
-
-    def confirm_break(self):
-        self.on_break = True
-        self.break_end_time = time.time() + BREAK_DURATION_SECONDS
-        self.lbl_status.config(text=f"Status: ON BREAK ({BREAK_DURATION_SECONDS}s)", fg="#f1c40f")
-        self.lbl_timer.config(foreground="#f1c40f")
-
-    def trigger_rapid_buzzer(self):
-        try:
-            # Send a 2-second alarm beep
-            urllib.request.urlopen("http://192.168.4.1/buzz?ms=2000", timeout=1)
-            print("🚨 FALSE ALARM BUZZER TRIGGERED!")
-        except Exception:
-            pass
 
     def update_gui_safe(self, posture_status, frame, is_break, gesture_status="None"):
         try:
@@ -337,23 +346,19 @@ class WorkerTrackerApp:
                     self.lbl_timer.config(foreground="#95a5a6")
                     self.lbl_status.config(text=f"Status: {posture_status}", fg="#95a5a6")
 
-            # Show countdown if hand is being raised
             if self.hand_raise_start > 0 and not self.awaiting_thumbs_up:
                 remaining = 5.0 - (time.time() - self.hand_raise_start)
-                self.lbl_gesture.config(text=f"Gesture: Hold Open Hand... {remaining:.1f}s", fg="#f1c40f")
+                self.lbl_gesture.config(text=f"Hold 5 fingers... {remaining:.1f}s", fg="#f1c40f")
 
         except Exception as e:
             print(f"GUI Update Error: {e}")
 
-    def handle_break_logic(self):
-        if time.time() >= self.break_end_time:
-            self.on_break = False
-            self.lbl_status.config(text="Status: Working", fg="#2ecc71")
-
     def request_break(self):
         if self.on_break: return
         if messagebox.askyesno("Break Request", "Request a 5-minute break?"):
-            self.confirm_break()
+            self.on_break = True
+            self.break_end_time = time.time() + BREAK_DURATION_SECONDS
+            self.lbl_status.config(text=f"Status: ON BREAK ({BREAK_DURATION_SECONDS}s)", fg="#f1c40f")
 
     def finish_work(self):
         self.is_running = False
@@ -362,14 +367,10 @@ class WorkerTrackerApp:
         end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         total_work_str = time.strftime("%H:%M:%S", time.gmtime(self.elapsed_work_time))
         total_down_str = time.strftime("%H:%M:%S", time.gmtime(self.elapsed_downtime))
-        self.save_to_excel(end_timestamp, total_work_str, total_down_str)
-        messagebox.showinfo("Session Ended",
-                            f"Worker ID: {self.worker_id}\nWork: {total_work_str}\nDowntime: {total_down_str}")
-        self.reset_ui()
 
-    def save_to_excel(self, end_time, work_time, down_time):
         new_data = {"Worker ID": [self.worker_id], "Date": [datetime.now().strftime("%Y-%m-%d")],
-                    "End Time": [end_time], "Total Work Time": [work_time], "Total Downtime": [down_time]}
+                    "End Time": [end_timestamp], "Total Work Time": [total_work_str],
+                    "Total Downtime": [total_down_str]}
         df_new = pd.DataFrame(new_data)
         if os.path.exists(EXCEL_FILE):
             try:
@@ -383,6 +384,10 @@ class WorkerTrackerApp:
             df_final.to_excel(EXCEL_FILE, index=False)
         except PermissionError:
             messagebox.showerror("Error", "Close the Excel file and try again.")
+
+        messagebox.showinfo("Session Ended",
+                            f"Worker ID: {self.worker_id}\nWork: {total_work_str}\nDowntime: {total_down_str}")
+        self.reset_ui()
 
     def reset_ui(self):
         self.entry_id.config(state=tk.NORMAL)
